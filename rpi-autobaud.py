@@ -10,9 +10,8 @@ import os
 import argparse
 
 # Default configuration
-BAUD_RATES = [4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
+BAUD_RATES = [4800, 9600, 19200, 38400, 57600, 115200, 230400]
 CONFIDENCE_RATIO = 2.0  # Best score must be this much better than second-best
-MAX_ABS_ERROR = 0.05    # Max normalized average error for a confident match
 MIN_SAMPLES = 40        # Minimum required number of intervals
 DESIRED_SAMPLES = 200   # Desired number of intervals for optimal results
 
@@ -35,7 +34,7 @@ def main():
     baud, best_error, confidence = select_baud_rate(intervals)
     
     # Make decision based on returned values
-    if confidence >= CONFIDENCE_RATIO and best_error < MAX_ABS_ERROR:
+    if confidence >= CONFIDENCE_RATIO:
         # Only output the baud rate to stdout
         print(baud)
         sys.exit(0)
@@ -138,40 +137,55 @@ def collect_intervals(gpio_pin, timeout):
     return intervals
 
 def select_baud_rate(intervals):
-    """Analyze intervals to determine the most likely baud rate"""
-    # Score each baud rate using normalized squared error
+    """Determine baud rate by clustering the intervals into buckets and
+    finding the first local maximum in a convolved histogram (±3 around each bucket).
+    
+    Buckets represent interval values in µs from 1 up to n_bucket-1.
+    The first local maximum is assumed to be the one‑bit period.
+    """
+    n_bucket = 250
+    window = 3  # ±3 µs
+
+    # Create histogram for buckets 1 to n_bucket-1
+    buckets = [0] * n_bucket  # Index 0 unused.
+    for s in intervals:
+        if 1 <= s < n_bucket:
+            buckets[s] += 1
+
+    # Convolve the histogram with a window of ±3
+    conv = [0] * n_bucket
+    for i in range(1, n_bucket):
+        start = max(1, i - window)
+        end = min(n_bucket - 1, i + window)
+        conv[i] = sum(buckets[j] for j in range(start, end + 1))
+
+    # Use first local maximum as estimated bit period
+    estimated_bit = n_bucket - 1
+    for i in range(2, n_bucket):
+        if conv[i] < conv[i - 1]:
+            estimated_bit = i - 1
+            break
+
+    # Compare the estimated bit period with each candidate baud's expected bit period
+    # using a relative error metric.
     results = []
     for baud in BAUD_RATES:
-        bit_us = 1_000_000 / baud
-        error_sq_sum = 0
-        count = 0
-        for interval in intervals:
-            n = round(interval / bit_us)
-            if n == 0:
-                continue
-            quantized = n * bit_us
-            relative_error = (interval - quantized) / bit_us
-            error_sq_sum += relative_error * relative_error
-            count += 1
-        if count > 0:
-            avg_error = error_sq_sum / count
-            results.append((avg_error, baud))
+        bit_period = 1_000_000 / baud  # Expected bit period in µs for this baud rate
+        rerror = abs(bit_period - estimated_bit) / bit_period
+        results.append((baud, bit_period, rerror))
 
-    if not results:
-        fatal("No valid baud candidates found - detected intervals are too short for standard baud rates.\n"
-              "This may indicate a high-frequency signal or noise on the pin.")
+    results.sort(key=lambda x: x[2])
+    best_baud, best_bit_period, best_error = results[0]
 
-    results.sort()
-    best_error, best_baud = results[0]
-
-    # Calculate confidence ratio
-    if len(results) >= 2:
-        second_error, second_baud = results[1]
-        confidence = (second_error / best_error) if best_error > 0 else float('inf')
+    # Confidence: ratio of the second best error to the best one.
+    if len(results) > 1 and best_error != 0:
+        confidence = results[1][2] / best_error
     else:
-        # Only one candidate, set confidence to infinity
         confidence = float('inf')
 
+    log(f"Estimated one-bit period: {estimated_bit} µs, "
+        f"Selected baud: {best_baud} (expected period: {best_bit_period:.2f} µs), "
+        f"Relative error: {best_error:.4f}, Confidence: {confidence:.2f}")
     return best_baud, best_error, confidence
 
 def fatal(msg):
